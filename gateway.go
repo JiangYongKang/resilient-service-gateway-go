@@ -8,11 +8,15 @@ import (
 // LogEvent 是一次网关决策的结构化日志记录。单测可通过 Gateway.Logger
 // 捕获这些字段并打印：下游标识、熔断状态、剩余预算、尝试次数、失败分类等。
 type LogEvent struct {
-	RequestID  string
-	Route      string
-	Phase      string // "reject" | "dispatch" | "backoff" | "terminal" | "success"
-	Breaker    string
-	Remaining  time.Duration
+	RequestID string
+	Route     string
+	Phase     string // "reject" | "dispatch" | "backoff" | "terminal" | "success"
+	// Breaker 是决策时刻的熔断状态文本；Remaining 是剩余总预算。
+	Breaker   string
+	Remaining time.Duration
+	// Unlimited 为 true 时该调用不设总截止时间，Remaining 不代表真实预算，
+	// 对外必须展示为“不设限（unlimited）”而不是某个具体时长。
+	Unlimited  bool
 	Attempt    int
 	MaxAttempt int
 	Reason     RejectReason

@@ -6,10 +6,12 @@ import "time"
 type RejectReason string
 
 const (
-	// ReasonDeadlineExpired 调用方声明的截止时间在派发前已经过期。
+	// ReasonDeadlineExpired 调用方声明的截止时间在派发前已经过期
+	// （剩余总预算 <= 0），与“仍有正剩余但不够一次尝试”相区分。
 	ReasonDeadlineExpired RejectReason = "deadline_expired"
-	// ReasonBudgetExhausted 剩余时间预算不足以再发起一次尝试（派发前预检保留值；
-	// 已有尝试发生后的预算耗尽统一以 TerminalError(budget_exhausted) 表达）。
+	// ReasonBudgetExhausted 首次派发前，调用方剩余总预算仍为正数，
+	// 但已不足以支撑一次配置的单次尝试预算（AttemptBudget）。
+	// 此时下游调用次数为 0，也不占用并发名额。
 	ReasonBudgetExhausted RejectReason = "budget_exhausted"
 	// ReasonCircuitOpen 下游熔断器处于打开状态，请求被快速拒绝。
 	ReasonCircuitOpen RejectReason = "circuit_open"
@@ -27,8 +29,13 @@ type TerminalKind string
 const (
 	// TerminalNonRetryable 下游返回了被分类为不可重试的失败。
 	TerminalNonRetryable TerminalKind = "non_retryable_failure"
-	// TerminalBudgetExhausted 重试用尽了调用方声明的时间预算（或在等待重试退避后预算耗尽）。
+	// TerminalBudgetExhausted 已经派发过至少一次尝试，随后调用方总预算
+	// 被尝试本身或重试退避耗尽（剩余 <= 0）。
 	TerminalBudgetExhausted TerminalKind = "budget_exhausted"
+	// TerminalBudgetInsufficient 重试链路上下一次尝试派发前，剩余总预算
+	// 仍为正数但不足以支撑一次单次尝试预算——此前已派发过尝试，
+	// 故以终局结束而非派发前拒绝。与 TerminalBudgetExhausted 相区分。
+	TerminalBudgetInsufficient TerminalKind = "budget_insufficient"
 	// TerminalCircuitOpen 调用已发生过尝试，但在重试途中熔断器打开（或隔离舱打满），
 	// 后续尝试在派发前被治理层拒绝，调用以终局结束。
 	TerminalCircuitOpen TerminalKind = "circuit_open"
@@ -68,20 +75,25 @@ type Request struct {
 // AttemptContext 是网关为单次下游尝试构造的上下文，
 // 下游实现必须尊重其中的截止时间。
 type AttemptContext struct {
-	Attempt  int
+	Attempt int
+	// Deadline 为本次尝试允许占用的最晚时刻，由“单次尝试预算”
+	// 与“当时剩余的调用方总预算”取小得到；零值表示本次尝试不设限，
+	// 下游不得把零值误解为一个很短的超时。
 	Deadline time.Time
 }
 
-// Remaining 返回该次尝试的剩余时间预算；无截止时间时返回一个很大的值。
-func (c AttemptContext) Remaining() time.Duration {
+// Remaining 返回该次尝试的剩余时间预算；无截止时间（不设限）时返回一个
+// 很大的值并伴随 ok=false，调用方不应把该数值当作真实预算展示。
+// 已过期时返回 0。
+func (c AttemptContext) Remaining() (d time.Duration, ok bool) {
 	if c.Deadline.IsZero() {
-		return time.Hour
+		return time.Hour, false
 	}
-	d := time.Until(c.Deadline)
+	d = time.Until(c.Deadline)
 	if d < 0 {
-		return 0
+		return 0, true
 	}
-	return d
+	return d, true
 }
 
 // Response 是网关返回给调用方的结果。原始下游错误永远不会出现在这里。
@@ -119,7 +131,14 @@ type RouteConfig struct {
 	ProbeMaxConcurrent int
 	// MaxConcurrent 关闭（及半开探测外）状态下该下游的最大并发。
 	MaxConcurrent int
-	// DefaultTimeout 调用方未声明截止时间时，单次尝试使用的默认超时；0 表示不限制。
+	// AttemptBudget 是每次向下游派发的单次尝试预算：一次尝试最多允许
+	// 占用下游多久。调用方给了总截止时间时，每次尝试的实际可用时间取
+	// AttemptBudget 与当时剩余总预算中的更小值；调用方未给总截止时间时，
+	// AttemptBudget 单独生效（优先于 DefaultTimeout）。0 表示不配置该预算，
+	// 此时行为与历史一致：仅有调用方截止时间或 DefaultTimeout 生效。
+	AttemptBudget time.Duration
+	// DefaultTimeout 调用方未声明截止时间、且未配置 AttemptBudget 时，
+	// 单次尝试使用的默认超时；0 表示不限制。
 	DefaultTimeout time.Duration
 	// Retry 重试配置。
 	Retry RetryConfig

@@ -12,6 +12,9 @@ type RejectError struct {
 	Reason RejectReason
 	// Remaining 拒绝时刻的剩余预算（仅用于日志与可解释性）。
 	Remaining time.Duration
+	// Unlimited 为 true 时调用方未声明总截止时间（不设限），
+	// Remaining 不代表真实预算；不设限的调用不会因预算被拒绝。
+	Unlimited bool
 }
 
 func (e *RejectError) Error() string {
