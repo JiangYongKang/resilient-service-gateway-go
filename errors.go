@@ -10,12 +10,20 @@ import (
 type RejectError struct {
 	Route  string
 	Reason RejectReason
-	// Remaining 拒绝时刻的剩余预算（仅用于日志与可解释性）。
+	// Limited 表示拒绝时调用方是否给出了有限的总截止时间。
+	Limited bool
+	// Remaining 拒绝时刻的剩余预算（仅当 Limited 为 true 时有意义，
+	// 用于日志与可解释性）；不设限时为 0，Error() 会输出 “unlimited”。
 	Remaining time.Duration
 }
 
 func (e *RejectError) Error() string {
-	return fmt.Sprintf("gateway: request to route %q rejected: %s", e.Route, e.Reason)
+	if !e.Limited {
+		return fmt.Sprintf("gateway: request to route %q rejected: %s (remaining budget: unlimited)",
+			e.Route, e.Reason)
+	}
+	return fmt.Sprintf("gateway: request to route %q rejected: %s (remaining budget: %s)",
+		e.Route, e.Reason, e.Remaining)
 }
 
 // TerminalError 表示一次调用的不可重试终局失败。

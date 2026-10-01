@@ -89,8 +89,8 @@ func (l *eventLog) logger(ev LogEvent) {
 	l.mu.Lock()
 	l.ev = append(l.ev, ev)
 	l.mu.Unlock()
-	l.t.Logf("[gateway-log] route=%s phase=%s breaker=%s remaining=%s attempt=%d/%d inflight=%d reason=%q class=%q kind=%q",
-		ev.Route, ev.Phase, ev.Breaker, ev.Remaining, ev.Attempt, ev.MaxAttempt,
+	l.t.Logf("[gateway-log] route=%s phase=%s breaker=%s remaining=%s attempt_budget=%s attempt=%d/%d inflight=%d reason=%q class=%q kind=%q",
+		ev.Route, ev.Phase, ev.Breaker, ev.BudgetText(), ev.AttemptText(), ev.Attempt, ev.MaxAttempt,
 		ev.InFlight, ev.Reason, ev.Class, ev.Kind)
 }
 

@@ -8,8 +8,8 @@ type RejectReason string
 const (
 	// ReasonDeadlineExpired 调用方声明的截止时间在派发前已经过期。
 	ReasonDeadlineExpired RejectReason = "deadline_expired"
-	// ReasonBudgetExhausted 剩余时间预算不足以再发起一次尝试（派发前预检保留值；
-	// 已有尝试发生后的预算耗尽统一以 TerminalError(budget_exhausted) 表达）。
+	// ReasonBudgetExhausted 首次派发前，调用方总预算仍为正但已不足以支撑一次
+	// 单次尝试（小于路由配置的 AttemptTimeout）；下游调用次数为 0，不占用并发名额。
 	ReasonBudgetExhausted RejectReason = "budget_exhausted"
 	// ReasonCircuitOpen 下游熔断器处于打开状态，请求被快速拒绝。
 	ReasonCircuitOpen RejectReason = "circuit_open"
@@ -27,7 +27,8 @@ type TerminalKind string
 const (
 	// TerminalNonRetryable 下游返回了被分类为不可重试的失败。
 	TerminalNonRetryable TerminalKind = "non_retryable_failure"
-	// TerminalBudgetExhausted 重试用尽了调用方声明的时间预算（或在等待重试退避后预算耗尽）。
+	// TerminalBudgetExhausted 已有至少一次尝试发生后，调用方预算耗尽，或剩余总预算
+	// 已不足以支撑路由配置的一次单次尝试，后续尝试不再派发。
 	TerminalBudgetExhausted TerminalKind = "budget_exhausted"
 	// TerminalCircuitOpen 调用已发生过尝试，但在重试途中熔断器打开（或隔离舱打满），
 	// 后续尝试在派发前被治理层拒绝，调用以终局结束。
@@ -121,6 +122,14 @@ type RouteConfig struct {
 	MaxConcurrent int
 	// DefaultTimeout 调用方未声明截止时间时，单次尝试使用的默认超时；0 表示不限制。
 	DefaultTimeout time.Duration
+	// AttemptTimeout 单次尝试预算：一次向下游派发最多允许占用的时长。
+	// 调用方给了总截止时间时，每次尝试实际取本预算与当时剩余总预算的更小值；
+	// 调用方未给总截止时间时，本预算单独生效（与 DefaultTimeout 取更小值）。
+	// 配置后，每次派发前都会检查剩余总预算是否足以支撑一次尝试：
+	// 首次不足直接拒绝（RejectError(budget_exhausted)，下游调用 0 次、不占并发名额），
+	// 重试途中不足则以 TerminalError(budget_exhausted) 结束，不再派发后续尝试。
+	// 0 表示不配置该预算，行为与历史版本完全一致。
+	AttemptTimeout time.Duration
 	// Retry 重试配置。
 	Retry RetryConfig
 	// Classifier 失败分类器；为 nil 时一律判定为不可重试。
