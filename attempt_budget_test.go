@@ -153,8 +153,9 @@ func TestAttemptBudgetDeadlineExpiredIsDistinct(t *testing.T) {
 }
 
 // TestAttemptBudgetRetryStopsWhenRemainingTooSmall 已经派发过一次、可重试失败后，
-// 重试链路剩余总预算不足一次单次尝试：停在已发生的尝试数上，终局为
-// budget_exhausted，与首次派发前拒绝区分，也不做退避等待。
+// 重试链路剩余总预算为正但不足一次单次尝试：停在已发生的尝试数上，终局为
+// budget_too_small（与总预算真正耗尽的 budget_exhausted 只凭 Kind 即可区分），
+// 不做退避等待；终局错误中的 Remaining 必须仍为正且小于单次尝试预算。
 func TestAttemptBudgetRetryStopsWhenRemainingTooSmall(t *testing.T) {
 	g := New()
 	// 第一次尝试尊重 ctx、耗时略小于单次预算（50ms）后可重试失败，
@@ -180,11 +181,24 @@ func TestAttemptBudgetRetryStopsWhenRemainingTooSmall(t *testing.T) {
 	if !errors.As(err, &term) {
 		t.Fatalf("err = %v, want *TerminalError", err)
 	}
-	if term.Kind != TerminalBudgetExhausted {
-		t.Fatalf("kind = %q, want budget_exhausted", term.Kind)
+	if term.Kind != TerminalBudgetTooSmall {
+		t.Fatalf("kind = %q, want budget_too_small (positive remainder, not real exhaustion)", term.Kind)
 	}
 	if term.Attempts != 1 {
 		t.Fatalf("attempts = %d, want 1 (stop after the dispatched attempt)", term.Attempts)
+	}
+	// 关键区分点：剩余总预算仍为正、只是小于单次尝试预算。
+	if !term.Limited {
+		t.Fatalf("Limited = false, want true for budget_too_small terminal")
+	}
+	if term.Remaining <= 0 {
+		t.Fatalf("remaining = %s, want strictly positive (distinct from budget_exhausted)", term.Remaining)
+	}
+	if term.Remaining >= cfg.AttemptTimeout {
+		t.Fatalf("remaining = %s, want < attempt budget %s", term.Remaining, cfg.AttemptTimeout)
+	}
+	if term.AttemptBudget != cfg.AttemptTimeout {
+		t.Fatalf("attempt budget = %s, want %s", term.AttemptBudget, cfg.AttemptTimeout)
 	}
 	if n := ds.count(); n != 1 {
 		t.Fatalf("downstream calls = %d, want exactly 1", n)
@@ -198,11 +212,14 @@ func TestAttemptBudgetRetryStopsWhenRemainingTooSmall(t *testing.T) {
 	// 终局前不应出现 backoff 事件。
 	for _, ev := range log.ev {
 		if ev.Phase == "backoff" {
-			t.Fatalf("unexpected backoff event before budget-exhausted terminal: %+v", ev)
+			t.Fatalf("unexpected backoff event before budget-too-small terminal: %+v", ev)
 		}
 	}
-	if ev := log.last(); ev.Phase != "terminal" || ev.Kind != TerminalBudgetExhausted {
-		t.Fatalf("last event = %+v, want terminal/budget_exhausted", ev)
+	if ev := log.last(); ev.Phase != "terminal" || ev.Kind != TerminalBudgetTooSmall {
+		t.Fatalf("last event = %+v, want terminal/budget_too_small", ev)
+	}
+	if !strings.Contains(err.Error(), "budget_too_small") {
+		t.Fatalf("error text = %q, want it to state budget_too_small", err.Error())
 	}
 }
 
@@ -256,8 +273,9 @@ func TestAttemptBudgetDeadlinePropagatedAndCapped(t *testing.T) {
 }
 
 // TestAttemptBudgetEnforcedByDownstream 下游按传播的截止时间执行：单次尝试预算
-// 把一次慢调用限制在单次预算内（这里用慢失败并以预算耗尽终局收尾，断言派发次数
-// 与尝试序号递增，且没有任何一次尝试能拿到超过单次预算的时间）。
+// 把一次慢调用限制在单次预算内（这里用慢失败并以 budget_too_small 终局收尾——
+// 总预算 140ms 在两次约 45ms 的尝试后仍为正、但已不足再跑一次 50ms 尝试；
+// 断言派发次数与尝试序号递增，且没有任何一次尝试能拿到超过单次预算的时间）。
 func TestAttemptBudgetEnforcedByDownstream(t *testing.T) {
 	g := New()
 	slow := func(_ AttemptContext) error {
@@ -267,6 +285,7 @@ func TestAttemptBudgetEnforcedByDownstream(t *testing.T) {
 	}
 	ds := newRecordingDownstream("svc-force", slow, slow, slow)
 	cfg := attemptBudgetConfig(ds)
+	cfg.Threshold = 10 // 熔断阈值高于尝试次数，专注验证预算预检
 	cfg.Retry.Backoff = time.Millisecond
 	g.RegisterRoute("svc-force", cfg)
 	attachLogger(t, g)
@@ -277,12 +296,16 @@ func TestAttemptBudgetEnforcedByDownstream(t *testing.T) {
 	_, err := g.Call(req)
 
 	var term *TerminalError
-	if !errors.As(err, &term) || term.Kind != TerminalBudgetExhausted {
-		t.Fatalf("err = %v, want TerminalError(budget_exhausted)", err)
+	if !errors.As(err, &term) || term.Kind != TerminalBudgetTooSmall {
+		t.Fatalf("err = %v, want TerminalError(budget_too_small)", err)
+	}
+	// 两次 ~45ms 尝试 + 1ms 退避后，总预算 140ms 仍为正但不足 50ms。
+	if term.Remaining <= 0 || term.Remaining >= cfg.AttemptTimeout {
+		t.Fatalf("remaining = %s, want in (0, %s) for budget_too_small", term.Remaining, cfg.AttemptTimeout)
 	}
 	calls := ds.snapshot()
 	if len(calls) < 2 {
-		t.Fatalf("expected retries before budget exhausted, got %d calls", len(calls))
+		t.Fatalf("expected retries before budget too small, got %d calls", len(calls))
 	}
 	for i, c := range calls {
 		if d := c.deadline.Sub(c.at); d > cfg.AttemptTimeout+10*time.Millisecond {

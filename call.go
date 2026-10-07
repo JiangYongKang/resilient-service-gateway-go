@@ -36,14 +36,24 @@ func (g *Gateway) reject(req Request, reason RejectReason, e *routeEntry) error 
 //  1. 总预算预检：调用方截止时间已过期 -> RejectError(deadline_expired)；
 //  2. 单次尝试预算预检（仅路由配置了 AttemptTimeout 时）：剩余总预算为正但
 //     不足以支撑一次单次尝试 -> 首次 RejectError(budget_exhausted)，重试途中
-//     TerminalError(budget_exhausted)；预检先于并发舱占用，不占下游名额；
+//     TerminalError(budget_too_small)；预检先于并发舱占用，不占下游名额；
 //  3. 并发隔离舱：槽位已满 -> RejectError(concurrency_limit)；
 //  4. 熔断器：打开 -> RejectError(circuit_open)；探测名额满 -> RejectError(probe_concurrency_limit)；
 //  5. 构造本次尝试截止时间：取“单次尝试预算（含无调用方截止时间时的默认超时）”
 //     与“当时剩余总预算”的更小值，传播给下游；
-//  6. 按失败分类 + 幂等性 + 剩余预算决定是否重试；
-//     退避后预算耗尽或已不足以再尝试 -> TerminalError(budget_exhausted)；
+//  6. 按失败分类 + 幂等性 + 剩余预算决定是否重试：
+//     本次尝试/退避把总预算耗光（剩余 ≤ 0）-> TerminalError(budget_exhausted)；
+//     总预算仍为正但已不足再跑一次单次尝试 -> TerminalError(budget_too_small)，
+//     不再派发，也不做无意义的退避等待；
 //     不可重试（含非幂等） -> TerminalError(non_retryable_failure)。
+//
+// 四种与预算/时限有关的结局互斥，只看返回值即可区分：
+//   - 还没派发、截止时间已过：RejectError(deadline_expired)，下游 0 次；
+//   - 还没派发、剩余为正但不够一次尝试：RejectError(budget_exhausted)，下游 0 次；
+//   - 已派发过、重试时剩余为正但不够一次尝试：TerminalError(budget_too_small)，
+//     Attempts ≥ 1（只是预算切得太碎，可加大预算或换更快的下游再试）；
+//   - 已派发过、总预算真正耗尽：TerminalError(budget_exhausted)，Attempts ≥ 1
+//     （总时限见底，只能按超时上报）。
 //
 // 调用方未给总截止时间、路由也未配置单次尝试预算与默认超时的调用属于不设限：
 // 不会被任何预算判定拒绝，成功、重试、熔断行为保持不变。
@@ -77,9 +87,11 @@ func (g *Gateway) Call(req Request) (*Response, error) {
 		// 语义二：剩余总预算仍为正，但已不足以支撑一次配置的单次尝试。
 		// 仅当路由配置了 AttemptTimeout 时该预检才生效；未配置时 canAttempt
 		// 只要求未过期，行为与历史版本一致。预检先于并发舱，绝不占用名额。
+		// 走到这里时 s.expired() 已为 false，故 canAttempt 失败必定是
+		// “剩余为正但不够一次”，而不是总预算真正耗尽。
 		if !s.canAttempt() {
 			if attempt > 1 {
-				return nil, g.terminal(req, e, attempt-1, TerminalBudgetExhausted, FailureNonRetryable)
+				return nil, g.terminal(req, e, attempt-1, TerminalBudgetTooSmall, FailureNonRetryable)
 			}
 			return nil, g.reject(req, ReasonBudgetExhausted, e)
 		}
@@ -158,12 +170,15 @@ func (g *Gateway) Call(req Request) (*Response, error) {
 		}
 
 		// 即使还能重试，剩余总预算已不足以支撑一次配置的单次尝试：
-		// 直接以预算耗尽终局结束，不再派发，也不再做无意义的退避等待。
+		// 此时总预算仍为正数（s.expired() 已在上面排除），只是被切得太碎，
+		// 直接以 budget_too_small 终局结束，不再派发，也不再做无意义的退避等待。
+		// 它与下面退避后总预算真正见底的 budget_exhausted 只凭 Kind 即可区分。
 		if !s.canAttempt() {
-			return nil, g.terminal(req, e, attempt, TerminalBudgetExhausted, class)
+			return nil, g.terminal(req, e, attempt, TerminalBudgetTooSmall, class)
 		}
 
-		// 退避时间被剩余预算截断；退避后不足以再尝试，则以预算耗尽终局结束。
+		// 退避时间被剩余预算截断；退避后先判定总预算是否真正耗尽（剩余 ≤ 0），
+		// 再判定是否仍不足一次尝试（剩余为正但过小）；两者返回不同的终局。
 		backoff := cfg.Retry.Backoff
 		rem := s.remaining
 		if backoff > rem {
@@ -179,8 +194,12 @@ func (g *Gateway) Call(req Request) (*Response, error) {
 		if backoff > 0 {
 			g.sleep(backoff)
 		}
-		if budgetSummary(req.Deadline, cfg.AttemptTimeout).expired() {
+		post := budgetSummary(req.Deadline, cfg.AttemptTimeout)
+		if post.expired() {
 			return nil, g.terminal(req, e, attempt, TerminalBudgetExhausted, class)
+		}
+		if !post.canAttempt() {
+			return nil, g.terminal(req, e, attempt, TerminalBudgetTooSmall, class)
 		}
 	}
 
@@ -198,7 +217,15 @@ func (g *Gateway) terminal(req Request, e *routeEntry, attempts int, kind Termin
 		Attempt:   attempts, MaxAttempt: e.cfg.Retry.MaxAttempts, InFlight: e.bulk.InFlight(),
 		Class: class.String(), Kind: kind,
 	})
-	return &TerminalError{Route: req.Route, Kind: kind, Class: class, Attempts: attempts}
+	return &TerminalError{
+		Route:         req.Route,
+		Kind:          kind,
+		Class:         class,
+		Attempts:      attempts,
+		Limited:       s.limited,
+		Remaining:     s.remaining,
+		AttemptBudget: e.cfg.AttemptTimeout,
+	}
 }
 
 // Status 返回指定路由的状态快照；未知路由返回 false。
