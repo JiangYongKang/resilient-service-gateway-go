@@ -36,14 +36,21 @@ func (g *Gateway) reject(req Request, reason RejectReason, e *routeEntry) error 
 //  1. 总预算预检：调用方截止时间已过期 -> RejectError(deadline_expired)；
 //  2. 单次尝试预算预检（仅路由配置了 AttemptTimeout 时）：剩余总预算为正但
 //     不足以支撑一次单次尝试 -> 首次 RejectError(budget_exhausted)，重试途中
-//     TerminalError(budget_exhausted)；预检先于并发舱占用，不占下游名额；
+//     TerminalError(budget_insufficient)；预检先于并发舱占用，不占下游名额；
 //  3. 并发隔离舱：槽位已满 -> RejectError(concurrency_limit)；
 //  4. 熔断器：打开 -> RejectError(circuit_open)；探测名额满 -> RejectError(probe_concurrency_limit)；
 //  5. 构造本次尝试截止时间：取“单次尝试预算（含无调用方截止时间时的默认超时）”
 //     与“当时剩余总预算”的更小值，传播给下游；
 //  6. 按失败分类 + 幂等性 + 剩余预算决定是否重试；
-//     退避后预算耗尽或已不足以再尝试 -> TerminalError(budget_exhausted)；
+//     退避后总预算真正耗尽（剩余 ≤ 0）-> TerminalError(budget_exhausted)；
+//     剩余仍为正但不足以再跑一次 -> TerminalError(budget_insufficient)；
 //     不可重试（含非幂等） -> TerminalError(non_retryable_failure)。
+//
+// 四种预算相关的拒绝/终局只靠返回值即可区分：
+// 还没派发就时限已过 RejectError(deadline_expired)、还没派发就不够跑一次
+// RejectError(budget_exhausted)、已派发过重试时不够跑一次
+// TerminalError(budget_insufficient)、已派发过重试时总预算真被耗光
+// TerminalError(budget_exhausted)。
 //
 // 调用方未给总截止时间、路由也未配置单次尝试预算与默认超时的调用属于不设限：
 // 不会被任何预算判定拒绝，成功、重试、熔断行为保持不变。
@@ -77,9 +84,11 @@ func (g *Gateway) Call(req Request) (*Response, error) {
 		// 语义二：剩余总预算仍为正，但已不足以支撑一次配置的单次尝试。
 		// 仅当路由配置了 AttemptTimeout 时该预检才生效；未配置时 canAttempt
 		// 只要求未过期，行为与历史版本一致。预检先于并发舱，绝不占用名额。
+		// 注意：同一预算视图上 expired() 已先判过，此处剩余必为正，
+		// 因此重试途中命中的是 budget_insufficient 而非 budget_exhausted。
 		if !s.canAttempt() {
 			if attempt > 1 {
-				return nil, g.terminal(req, e, attempt-1, TerminalBudgetExhausted, FailureNonRetryable)
+				return nil, g.terminal(req, e, attempt-1, TerminalBudgetInsufficient, FailureNonRetryable)
 			}
 			return nil, g.reject(req, ReasonBudgetExhausted, e)
 		}
@@ -158,9 +167,10 @@ func (g *Gateway) Call(req Request) (*Response, error) {
 		}
 
 		// 即使还能重试，剩余总预算已不足以支撑一次配置的单次尝试：
-		// 直接以预算耗尽终局结束，不再派发，也不再做无意义的退避等待。
+		// 直接以“预算不足”终局结束（剩余仍为正，与 budget_exhausted 区分），
+		// 不再派发，也不再做无意义的退避等待。
 		if !s.canAttempt() {
-			return nil, g.terminal(req, e, attempt, TerminalBudgetExhausted, class)
+			return nil, g.terminal(req, e, attempt, TerminalBudgetInsufficient, class)
 		}
 
 		// 退避时间被剩余预算截断；退避后不足以再尝试，则以预算耗尽终局结束。

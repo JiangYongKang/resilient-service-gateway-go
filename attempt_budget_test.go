@@ -153,8 +153,9 @@ func TestAttemptBudgetDeadlineExpiredIsDistinct(t *testing.T) {
 }
 
 // TestAttemptBudgetRetryStopsWhenRemainingTooSmall 已经派发过一次、可重试失败后，
-// 重试链路剩余总预算不足一次单次尝试：停在已发生的尝试数上，终局为
-// budget_exhausted，与首次派发前拒绝区分，也不做退避等待。
+// 重试链路剩余总预算仍为正但不足一次单次尝试：停在已发生的尝试数上，终局为
+// budget_insufficient（与总预算真耗光的 budget_exhausted 区分，也与首次派发前
+// 拒绝区分），且不做退避等待。
 func TestAttemptBudgetRetryStopsWhenRemainingTooSmall(t *testing.T) {
 	g := New()
 	// 第一次尝试尊重 ctx、耗时略小于单次预算（50ms）后可重试失败，
@@ -180,8 +181,8 @@ func TestAttemptBudgetRetryStopsWhenRemainingTooSmall(t *testing.T) {
 	if !errors.As(err, &term) {
 		t.Fatalf("err = %v, want *TerminalError", err)
 	}
-	if term.Kind != TerminalBudgetExhausted {
-		t.Fatalf("kind = %q, want budget_exhausted", term.Kind)
+	if term.Kind != TerminalBudgetInsufficient {
+		t.Fatalf("kind = %q, want budget_insufficient (remaining positive but < one attempt)", term.Kind)
 	}
 	if term.Attempts != 1 {
 		t.Fatalf("attempts = %d, want 1 (stop after the dispatched attempt)", term.Attempts)
@@ -198,11 +199,15 @@ func TestAttemptBudgetRetryStopsWhenRemainingTooSmall(t *testing.T) {
 	// 终局前不应出现 backoff 事件。
 	for _, ev := range log.ev {
 		if ev.Phase == "backoff" {
-			t.Fatalf("unexpected backoff event before budget-exhausted terminal: %+v", ev)
+			t.Fatalf("unexpected backoff event before budget-insufficient terminal: %+v", ev)
 		}
 	}
-	if ev := log.last(); ev.Phase != "terminal" || ev.Kind != TerminalBudgetExhausted {
-		t.Fatalf("last event = %+v, want terminal/budget_exhausted", ev)
+	if ev := log.last(); ev.Phase != "terminal" || ev.Kind != TerminalBudgetInsufficient {
+		t.Fatalf("last event = %+v, want terminal/budget_insufficient", ev)
+	}
+	// 终局时刻剩余总预算必须仍为正（否则应判 budget_exhausted）。
+	if rem := log.last().Remaining; rem <= 0 || rem >= cfg.AttemptTimeout {
+		t.Fatalf("terminal remaining = %s, want in (0, %s)", rem, cfg.AttemptTimeout)
 	}
 }
 
@@ -256,8 +261,9 @@ func TestAttemptBudgetDeadlinePropagatedAndCapped(t *testing.T) {
 }
 
 // TestAttemptBudgetEnforcedByDownstream 下游按传播的截止时间执行：单次尝试预算
-// 把一次慢调用限制在单次预算内（这里用慢失败并以预算耗尽终局收尾，断言派发次数
-// 与尝试序号递增，且没有任何一次尝试能拿到超过单次预算的时间）。
+// 把一次慢调用限制在单次预算内（这里用慢失败把总预算消耗到“为正但不足一次尝试”，
+// 以 budget_insufficient 终局收尾，断言派发次数与尝试序号递增，且没有任何一次
+// 尝试能拿到超过单次预算的时间）。
 func TestAttemptBudgetEnforcedByDownstream(t *testing.T) {
 	g := New()
 	slow := func(_ AttemptContext) error {
@@ -277,8 +283,8 @@ func TestAttemptBudgetEnforcedByDownstream(t *testing.T) {
 	_, err := g.Call(req)
 
 	var term *TerminalError
-	if !errors.As(err, &term) || term.Kind != TerminalBudgetExhausted {
-		t.Fatalf("err = %v, want TerminalError(budget_exhausted)", err)
+	if !errors.As(err, &term) || term.Kind != TerminalBudgetInsufficient {
+		t.Fatalf("err = %v, want TerminalError(budget_insufficient)", err)
 	}
 	calls := ds.snapshot()
 	if len(calls) < 2 {
@@ -387,6 +393,121 @@ func TestUnlimitedRejectErrorText(t *testing.T) {
 	if txt := log.last().BudgetText(); txt != "unlimited" {
 		t.Fatalf("BudgetText = %q, want unlimited", txt)
 	}
+}
+
+// TestBudgetOutcomesFourWayDistinct 预算相关的四种拒绝/终局必须只靠返回值
+// （错误类型 + Reason/Kind 字段）即可两两区分：
+//  1. 还没派发就时限已过        -> *RejectError(deadline_expired)，下游 0 次；
+//  2. 还没派发就不够跑一次      -> *RejectError(budget_exhausted)，下游 0 次；
+//  3. 已派发过，重试时不够跑一次 -> *TerminalError(budget_insufficient)，下游 1 次；
+//  4. 已派发过，总预算真被耗光   -> *TerminalError(budget_exhausted)，下游 1 次。
+func TestBudgetOutcomesFourWayDistinct(t *testing.T) {
+	const attemptBudget = 50 * time.Millisecond
+
+	newRoute := func(name string, ds Downstream, backoff time.Duration) *Gateway {
+		g := New()
+		cfg := attemptBudgetConfig(ds)
+		cfg.Threshold = 10 // 熔断阈值高于尝试次数，专注验证预算语义
+		cfg.Retry.Backoff = backoff
+		g.RegisterRoute(name, cfg)
+		attachLogger(t, g)
+		return g
+	}
+
+	// 场景 1：还没派发，调用方截止时间就已过期。
+	g1 := newRoute("svc-outcome-expired", newRecordingDownstream("svc-outcome-expired"), time.Millisecond)
+	ds1 := g1.mustDownstream(t, "svc-outcome-expired")
+	_, err1 := g1.Call(Request{ID: "o1", Route: "svc-outcome-expired", Idempotent: true,
+		Deadline: time.Now().Add(-time.Millisecond)})
+
+	// 场景 2：还没派发，剩余为正但不足一次单次尝试。
+	g2 := newRoute("svc-outcome-short", newRecordingDownstream("svc-outcome-short"), time.Millisecond)
+	ds2 := g2.mustDownstream(t, "svc-outcome-short")
+	_, err2 := g2.Call(Request{ID: "o2", Route: "svc-outcome-short", Idempotent: true,
+		Deadline: time.Now().Add(30 * time.Millisecond)}) // 30ms < 50ms 单次预算
+
+	// 场景 3：已派发过一次，失败后剩余仍为正但不足再跑一次。
+	slowFail := func(_ AttemptContext) error {
+		time.Sleep(30 * time.Millisecond) // 消耗到剩余 ~40ms：为正但 < 50ms 单次预算
+		return errFakeDownstream
+	}
+	g3 := newRoute("svc-outcome-insufficient", newRecordingDownstream("svc-outcome-insufficient", slowFail), time.Hour)
+	ds3 := g3.mustDownstream(t, "svc-outcome-insufficient")
+	_, err3 := g3.Call(Request{ID: "o3", Route: "svc-outcome-insufficient", Idempotent: true,
+		Deadline: time.Now().Add(70 * time.Millisecond)})
+
+	// 场景 4：已派发过一次，退避把总预算真正耗光（剩余 ≤ 0）。
+	g4 := newRoute("svc-outcome-exhausted", newRecordingDownstream("svc-outcome-exhausted", failRetryable), time.Hour)
+	ds4 := g4.mustDownstream(t, "svc-outcome-exhausted")
+	g4.Sleep = time.Sleep // 真实退避：被剩余预算截断后把总预算睡光
+	_, err4 := g4.Call(Request{ID: "o4", Route: "svc-outcome-exhausted", Idempotent: true,
+		Deadline: time.Now().Add(60 * time.Millisecond)})
+
+	// 场景 1/2：都是 *RejectError，但 Reason 不同。
+	var rej1, rej2 *RejectError
+	if !errors.As(err1, &rej1) || rej1.Reason != ReasonDeadlineExpired {
+		t.Fatalf("scenario1 err = %v, want RejectError(deadline_expired)", err1)
+	}
+	if !errors.As(err2, &rej2) || rej2.Reason != ReasonBudgetExhausted {
+		t.Fatalf("scenario2 err = %v, want RejectError(budget_exhausted)", err2)
+	}
+	if rej1.Reason == rej2.Reason {
+		t.Fatalf("scenario1/2 reasons must differ, both %q", rej1.Reason)
+	}
+
+	// 场景 3/4：都是 *TerminalError，但 Kind 不同。
+	var term3, term4 *TerminalError
+	if !errors.As(err3, &term3) || term3.Kind != TerminalBudgetInsufficient {
+		t.Fatalf("scenario3 err = %v, want TerminalError(budget_insufficient)", err3)
+	}
+	if !errors.As(err4, &term4) || term4.Kind != TerminalBudgetExhausted {
+		t.Fatalf("scenario4 err = %v, want TerminalError(budget_exhausted)", err4)
+	}
+	if term3.Kind == term4.Kind {
+		t.Fatalf("scenario3/4 kinds must differ, both %q", term3.Kind)
+	}
+
+	// 派发前拒绝与派发后终局在错误类型上必须可区分。
+	var term *TerminalError
+	if errors.As(err1, &term) || errors.As(err2, &term) {
+		t.Fatalf("pre-dispatch rejects must not be TerminalError: %v / %v", err1, err2)
+	}
+	var rej *RejectError
+	if errors.As(err3, &rej) || errors.As(err4, &rej) {
+		t.Fatalf("post-dispatch terminals must not be RejectError: %v / %v", err3, err4)
+	}
+
+	// 下游调用次数：拒绝场景 0 次，终局场景恰好 1 次。
+	for name, got := range map[string]int{
+		"expired": ds1.count(), "short": ds2.count(),
+		"insufficient": ds3.count(), "exhausted": ds4.count(),
+	} {
+		want := 0
+		if name == "insufficient" || name == "exhausted" {
+			want = 1
+		}
+		if got != want {
+			t.Fatalf("scenario %s downstream calls = %d, want %d", name, got, want)
+		}
+	}
+	if term3.Attempts != 1 || term4.Attempts != 1 {
+		t.Fatalf("terminal attempts = %d/%d, want 1/1", term3.Attempts, term4.Attempts)
+	}
+	t.Logf("four outcomes: %q / %q / %q / %q", rej1.Reason, rej2.Reason, term3.Kind, term4.Kind)
+}
+
+// mustDownstream 取回注册时使用的记录型下游（测试辅助）。
+func (g *Gateway) mustDownstream(t *testing.T, route string) *recordingDownstream {
+	t.Helper()
+	e := g.lookup(route)
+	if e == nil {
+		t.Fatalf("route %s missing", route)
+	}
+	ds, ok := e.cfg.Downstream.(*recordingDownstream)
+	if !ok {
+		t.Fatalf("route %s downstream is %T, want *recordingDownstream", route, e.cfg.Downstream)
+	}
+	return ds
 }
 
 // TestNoAttemptTimeoutKeepsLegacyBehavior 未配置单次尝试预算时，即使剩余总预算

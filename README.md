@@ -66,14 +66,24 @@ resp, err := g.Call(gateway.Request{
 | 原因 | 含义 |
 | --- | --- |
 | `non_retryable_failure` | 失败分类为不可重试，或调用方未声明幂等，或已达 `MaxAttempts` |
-| `budget_exhausted` | **已有至少一次尝试发生后**，预算不再允许后续尝试：尝试本身/退避耗尽调用方预算，或重试途中剩余总预算已不足一次单次尝试 |
+| `budget_insufficient` | **已有至少一次尝试发生后**，重试途中剩余总预算**仍为正**、但已不足一次配置好的单次尝试（`< AttemptTimeout`）；总时限尚未见底，调用方可加大总预算或换更快的下游再试 |
+| `budget_exhausted` | **已有至少一次尝试发生后**，调用方总预算**真正耗尽**（剩余 ≤ 0：尝试本身/退避耗光，或重试途中截止时间到期）；只能按超时上报 |
 | `circuit_open` | 同一调用的重试途中熔断器打开（或隔离舱打满），后续尝试被治理层拒绝 |
 
-> 同为“预算不够”，首次派发前命中是 `*RejectError(budget_exhausted)`
-> （下游 0 次、不占并发名额）；重试链路中途命中是
-> `*TerminalError(budget_exhausted)`，`Attempts` 为已实际派发的次数。
-> 调用方只看错误类型与原因字段即可区分：没派发过 / 派发过但中途预算耗光 /
-> 调用方截止时间早已过去。
+> 预算相关的四种结果只靠返回值即可区分（`errors.As` 取错误类型，再读
+> `Reason`/`Kind` 字段）：
+>
+> | 场景 | 调用方看到的结果 | 下游调用次数 |
+> | --- | --- | --- |
+> | 还没派发，调用方截止时间就已过期（剩余 ≤ 0） | `*RejectError` / `deadline_expired` | 0 |
+> | 还没派发，剩余为正但不足一次单次尝试 | `*RejectError` / `budget_exhausted` | 0 |
+> | 已派发过，重试时剩余为正但不足一次单次尝试 | `*TerminalError` / `budget_insufficient` | ≥ 1 |
+> | 已派发过，重试时总预算真被耗光（剩余 ≤ 0） | `*TerminalError` / `budget_exhausted` | ≥ 1 |
+>
+> 后两种是**互斥**的两种终局：同为 `*TerminalError`，但 `Kind` 不同——
+> `budget_insufficient` 说明只是这次预算切得太碎（剩余仍为正），可以加大
+> 预算或换更快的下游再试；`budget_exhausted` 说明总时限已经见底，只能按
+> 超时上报。`Attempts` 均为已实际派发的次数。
 
 ## 熔断阈值语义与状态迁移
 
@@ -139,17 +149,13 @@ resp, err := g.Call(gateway.Request{
 
 - **首次**就遇到：直接返回 `*RejectError(budget_exhausted)`，下游调用次数
   **必须为 0**，也**不占用并发名额**；
-- **重试链路**上遇到（已经派发过一次或多次）：停止派发后续尝试，返回
-  `*TerminalError(budget_exhausted)`，`Attempts` 等于已实际派发的次数；
-  网关也不会再做一段注定无意义的退避等待。
+- **重试链路**上遇到（已经派发过一次或多次，剩余仍为正）：停止派发后续尝试，
+  返回 `*TerminalError(budget_insufficient)`，`Attempts` 等于已实际派发的次数；
+  网关也不会再做一段注定无意义的退避等待；
+- **重试链路**上总预算真正耗尽（剩余 ≤ 0，含退避后到期）：返回
+  `*TerminalError(budget_exhausted)`，与上一种只靠 `Kind` 字段即可区分。
 
-三种“预算相关终局”对照：
-
-| 场景 | 调用方看到的结果 | 下游调用次数 |
-| --- | --- | --- |
-| 调用方截止时间派发前就已过期（剩余 ≤ 0） | `*RejectError` / `deadline_expired` | 0 |
-| 剩余为正但不足一次配置好的单次尝试（首次） | `*RejectError` / `budget_exhausted` | 0 |
-| 已派发过，重试途中预算耗尽或不足一次尝试 | `*TerminalError` / `budget_exhausted` | ≥ 1 |
+四种“预算相关拒绝/终局”的完整对照见上文「TerminalKind」一节的表格。
 
 未配置 `AttemptTimeout` 的路由完全保持旧行为：剩余多少就尝试多少，不做
 “不足一次尝试”的额外预检（见 `TestNoAttemptTimeoutKeepsLegacyBehavior`）。
@@ -170,7 +176,8 @@ resp, err := g.Call(gateway.Request{
 ### 其他既有规则
 
 - 每次尝试返回后、每次退避后都重新检查总预算；退避时间会被剩余总预算截断；
-  退避（或本次尝试）耗尽总预算时终局为 `budget_exhausted`。
+  退避（或本次尝试）把总预算真正耗光（剩余 ≤ 0）时终局为 `budget_exhausted`，
+  剩余仍为正但不够再跑一次时终局为 `budget_insufficient`。
 - 重试不绕过熔断器、并发舱与单次尝试预算。
 
 ## 重试规则
@@ -184,8 +191,9 @@ resp, err := g.Call(gateway.Request{
    仍足以支撑一次单次尝试）。
 
 `MaxAttempts` 含首次尝试（`3` 表示最多派发 3 次、退避 2 次）。不满足任一
-条件即终局：不可重试/非幂等/次数用尽 → `non_retryable_failure`；
-预算耗尽 → `budget_exhausted`。重试不绕过熔断器与并发舱。
+条件即终局：不可重试/非幂等/次数用尽 → `non_retryable_failure`；总预算真
+被耗光（剩余 ≤ 0）→ `budget_exhausted`；剩余仍为正但不够再跑一次 →
+`budget_insufficient`。重试不绕过熔断器与并发舱。
 
 ## 并发限制配置
 
@@ -220,7 +228,7 @@ go test ./... -race -count=10 -v
 只验证单次尝试预算相关行为可运行：
 
 ```bash
-go test ./... -race -count=50 -v -run 'TestAttemptBudget|TestUnlimited|TestNoAttemptTimeout'
+go test ./... -race -count=50 -v -run 'TestAttemptBudget|TestBudgetOutcomes|TestUnlimited|TestNoAttemptTimeout'
 ```
 
 也可在接入代码中快速自查：
@@ -231,9 +239,30 @@ go test ./... -race -count=50 -v -run 'TestAttemptBudget|TestUnlimited|TestNoAtt
   下游完全不被调用；
 - 把截止时间改为 `time.Now().Add(-time.Millisecond)`，应得到
   `ReasonDeadlineExpired`，与上一种原因明确不同；
+- 配 `AttemptTimeout: 50ms`、`Deadline: now+70ms`，让首次尝试耗时 ~30ms
+  后可重试失败：剩余 ~40ms 为正但不够再跑一次，应得到 `*gateway.TerminalError`
+  且 `Kind == gateway.TerminalBudgetInsufficient`；
+- 同样配置下让退避（真实等待）把总预算睡光，应得到 `*gateway.TerminalError`
+  且 `Kind == gateway.TerminalBudgetExhausted`——与上一种同为终局但 `Kind`
+  不同，只靠返回值即可区分“预算切得太碎”与“总时限见底”；
 - 不传 `Deadline`、也不配 `AttemptTimeout`/`DefaultTimeout`，注入自定义
   `Logger` 后应看到 `remaining=unlimited`，下游收到的
   `AttemptContext.Deadline` 为零值。
+
+### 兼容范围
+
+本轮只拆分“重试途中预算不足”的终局语义，其余行为完全不变：
+
+- **唯一行为变化**：已派发过、剩余总预算为正但不足一次单次尝试的终局，
+  `TerminalKind` 由 `budget_exhausted` 改为 `budget_insufficient`（此前它与
+  “总预算真被耗光”混用同一个 Kind，无法区分）；`budget_exhausted` 现在只
+  表示剩余 ≤ 0 的真耗尽。
+- 未配置 `AttemptTimeout` 的路由、调用方未给截止时间的调用：行为与之前
+  **一模一样**，不会被误拒、也不会被误判成预算耗尽（这两种情况根本不会
+  进入“不足一次尝试”的判定）。
+- 每次尝试仍取 `min(单次尝试预算, 当时剩余总预算)` 传播给下游；不够跑一次
+  仍不派发、不做无意义的退避等待；首次派发前的两种拒绝
+  （`deadline_expired` / `budget_exhausted`）语义不变。
 
 测试覆盖（结论稳定可复现，单测日志通过 `t.Logf` 打印上述字段）：
 
@@ -245,9 +274,12 @@ go test ./... -race -count=50 -v -run 'TestAttemptBudget|TestUnlimited|TestNoAtt
 - **截止时间过期与传播**：过期派发前拒绝、截止时间原样传播、尝试超时/退避
   耗尽预算的终局区分（`deadline_test.go`）；
 - **单次尝试预算**：首次剩余为正但不足一次尝试直接拒绝（下游 0 次、不占
-  并发名额）、与 `deadline_expired` 语义区分、重试途中不足一次尝试即终局且
-  不再退避、每次尝试截止时间取“单次预算与剩余总预算更小值”、无调用方截止
-  时间时单次预算单独生效、未配置时保持历史行为（`attempt_budget_test.go`）；
+  并发名额）、与 `deadline_expired` 语义区分、重试途中不足一次尝试即终局
+  `budget_insufficient` 且不再退避、重试途中总预算真耗光终局
+  `budget_exhausted`、四种预算相关拒绝/终局只靠返回值两两可区分
+  （`TestBudgetOutcomesFourWayDistinct`）、每次尝试截止时间取“单次预算与
+  剩余总预算更小值”、无调用方截止时间时单次预算单独生效、未配置时保持
+  历史行为（`attempt_budget_test.go`）；
 - **不设限表达**：日志 `remaining/attempt_budget=unlimited`、下游收到零截止
   时间、`RejectError` 文本写明 unlimited 且不泄露哨兵时长、不设限调用不被
   预算判定影响（`attempt_budget_test.go`）；

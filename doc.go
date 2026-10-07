@@ -15,8 +15,13 @@
 //     的更小值；调用方未给截止时间时单次尝试预算（及 DefaultTimeout）单独生效。
 //   - 配置了单次尝试预算后，每次派发前都做预检：剩余总预算为正但不足一次尝试时，
 //     首次直接 RejectError(budget_exhausted)（下游 0 次、不占并发名额），重试途中
-//     则 TerminalError(budget_exhausted)。它与 deadline_expired（截止时间已过期）
-//     以及“已派发后预算才耗尽”都是不同语义。
+//     则 TerminalError(budget_insufficient)；重试途中总预算真正耗尽（剩余 ≤ 0）
+//     才是 TerminalError(budget_exhausted)。四种预算相关的拒绝/终局——
+//     还没派发就时限已过 RejectError(deadline_expired)、还没派发就不够跑一次
+//     RejectError(budget_exhausted)、已派发过重试时不够跑一次
+//     TerminalError(budget_insufficient)、已派发过重试时总预算真被耗光
+//     TerminalError(budget_exhausted)——只靠返回值的错误类型与 Reason/Kind
+//     字段即可两两区分。
 //   - 调用方未给截止时间、路由也未配置单次尝试预算与默认超时的调用属于不设限：
 //     日志与 RejectError 文本一律表达为 "unlimited"，且不会被任何预算判定拒绝。
 package gateway

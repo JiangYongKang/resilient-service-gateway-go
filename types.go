@@ -27,9 +27,16 @@ type TerminalKind string
 const (
 	// TerminalNonRetryable 下游返回了被分类为不可重试的失败。
 	TerminalNonRetryable TerminalKind = "non_retryable_failure"
-	// TerminalBudgetExhausted 已有至少一次尝试发生后，调用方预算耗尽，或剩余总预算
-	// 已不足以支撑路由配置的一次单次尝试，后续尝试不再派发。
+	// TerminalBudgetExhausted 已有至少一次尝试发生后，调用方总预算真正耗尽
+	// （剩余 ≤ 0，含尝试本身、退避或重试途中截止时间到期），后续尝试不再派发。
+	// 与 TerminalBudgetInsufficient 互斥：后者表示剩余仍为正、只是不够再跑一次。
 	TerminalBudgetExhausted TerminalKind = "budget_exhausted"
+	// TerminalBudgetInsufficient 已有至少一次尝试发生后，重试途中剩余总预算
+	// 仍为正、但已不足以支撑路由配置的一次单次尝试（< AttemptTimeout），
+	// 后续尝试不再派发，也不再做无意义的退避等待。
+	// 与 TerminalBudgetExhausted 互斥：本语义下总时限尚未见底，调用方可以
+	// 加大总预算或换更快的下游再试；只有配置了 AttemptTimeout 才可能出现。
+	TerminalBudgetInsufficient TerminalKind = "budget_insufficient"
 	// TerminalCircuitOpen 调用已发生过尝试，但在重试途中熔断器打开（或隔离舱打满），
 	// 后续尝试在派发前被治理层拒绝，调用以终局结束。
 	TerminalCircuitOpen TerminalKind = "circuit_open"
@@ -126,8 +133,10 @@ type RouteConfig struct {
 	// 调用方给了总截止时间时，每次尝试实际取本预算与当时剩余总预算的更小值；
 	// 调用方未给总截止时间时，本预算单独生效（与 DefaultTimeout 取更小值）。
 	// 配置后，每次派发前都会检查剩余总预算是否足以支撑一次尝试：
-	// 首次不足直接拒绝（RejectError(budget_exhausted)，下游调用 0 次、不占并发名额），
-	// 重试途中不足则以 TerminalError(budget_exhausted) 结束，不再派发后续尝试。
+	// 首次不足直接拒绝（RejectError(budget_exhausted)，下游调用 0 次、不占并发名额）；
+	// 重试途中剩余仍为正但不足则以 TerminalError(budget_insufficient) 结束，
+	// 重试途中总预算真正耗尽（剩余 ≤ 0）则以 TerminalError(budget_exhausted) 结束，
+	// 两者都不再派发后续尝试。
 	// 0 表示不配置该预算，行为与历史版本完全一致。
 	AttemptTimeout time.Duration
 	// Retry 重试配置。
